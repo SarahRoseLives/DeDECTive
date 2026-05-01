@@ -1,4 +1,6 @@
+#include "sdr_source.h"
 #include "hackrf_source.h"
+#include "pluto_source.h"
 #include "wideband_monitor.h"
 #include "packet_receiver.h"
 #include "packet_decoder.h"
@@ -70,7 +72,7 @@ struct NarrowbandContext {
 };
 
 struct CaptureController {
-    HackrfSource     hackrf;
+    std::unique_ptr<SdrSource> sdr;
     WidebandMonitor  monitor;
     AudioOutput      audio;
     bool             device_open = false;
@@ -92,17 +94,17 @@ struct CaptureController {
         last_error.clear();
         if (!open_device()) return false;
 
-        if (!hackrf.set_sample_rate(WIDEBAND_SAMPLE_RATE) ||
+        if (!sdr->set_sample_rate(WIDEBAND_SAMPLE_RATE) ||
             !apply_gains() ||
-            !hackrf.set_freq(monitor.center_freq())) {
-            last_error = hackrf.last_error();
+            !sdr->set_freq(monitor.center_freq())) {
+            last_error = sdr->last_error();
             return false;
         }
 
-        if (!hackrf.start([this](const std::complex<float>* samples, size_t n) {
+        if (!sdr->start([this](const std::complex<float>* samples, size_t n) {
                 monitor.ingest(samples, n);
             })) {
-            last_error = hackrf.last_error();
+            last_error = sdr->last_error();
             return false;
         }
 
@@ -176,14 +178,14 @@ struct CaptureController {
         );
 
         uint64_t freq = channels[channel_index].freq_hz;
-        if (!hackrf.set_sample_rate(SAMPLE_RATE) ||
+        if (!sdr->set_sample_rate(SAMPLE_RATE) ||
             !apply_gains() ||
-            !hackrf.set_freq(freq)) {
-            last_error = hackrf.last_error();
+            !sdr->set_freq(freq)) {
+            last_error = sdr->last_error();
             return false;
         }
 
-        if (!hackrf.start([this](const std::complex<float>* samples, size_t n) {
+        if (!sdr->start([this](const std::complex<float>* samples, size_t n) {
                 for (size_t i = 0; i < n; ++i) {
                     auto s = dc_block_enabled
                         ? nb.dc_blocker.process(samples[i]) : samples[i];
@@ -191,7 +193,7 @@ struct CaptureController {
                     nb.receiver->process_sample(phase);
                 }
             })) {
-            last_error = hackrf.last_error();
+            last_error = sdr->last_error();
             return false;
         }
 
@@ -206,10 +208,10 @@ struct CaptureController {
 
     void stop() {
         if (mode != CaptureMode::IDLE) {
-            hackrf.stop();
+            sdr->stop();
         }
         if (device_open) {
-            hackrf.close();
+            sdr->close();
             device_open = false;
         }
         audio.stop();
@@ -226,8 +228,18 @@ struct CaptureController {
 private:
     bool open_device() {
         if (!device_open) {
-            if (!hackrf.open()) {
-                last_error = hackrf.last_error();
+            // bodge in pluto
+            bool use_pluto = false;
+             if (!use_pluto) {
+                sdr = std::make_unique<HackrfSource>();
+                std::printf("DeDECTive — Opening HackRF... ");
+            }
+            else {
+                sdr = std::make_unique<PlutoSource>();
+                std::printf("DeDECTive — Opening Pluto... ");
+            }
+            if (!sdr->open()) {
+                last_error = sdr->last_error();
                 return false;
             }
             device_open = true;
@@ -236,9 +248,9 @@ private:
     }
 
     bool apply_gains() {
-        return hackrf.set_lna_gain(lna_gain) &&
-               hackrf.set_vga_gain(vga_gain) &&
-               hackrf.set_amp_enable(amp_enable);
+        return sdr->set_lna_gain(lna_gain) &&
+               sdr->set_vga_gain(vga_gain) &&
+               sdr->set_amp_enable(amp_enable);
     }
 };
 

@@ -9,7 +9,9 @@
  * Usage:  dedective [options]
  */
 
+#include "sdr_source.h"
 #include "hackrf_source.h"
+#include "pluto_source.h"
 #include "phase_diff.h"
 #include "packet_receiver.h"
 #include "packet_decoder.h"
@@ -84,7 +86,7 @@ struct NarrowbandState {
 };
 
 // ── Voice-follow mode ─────────────────────────────────────────────────────────
-static int voice_follow_mode(HackrfSource& hackrf,
+static int voice_follow_mode(std::unique_ptr<SdrSource> &sdr,
                              uint32_t lna_gain, uint32_t vga_gain,
                              bool amp_enable, DectBand band)
 {
@@ -114,24 +116,24 @@ static int voice_follow_mode(HackrfSource& hackrf,
     term.enable();
 
     auto apply_gains = [&]() -> bool {
-        return hackrf.set_lna_gain(lna_gain) &&
-               hackrf.set_vga_gain(vga_gain) &&
-               hackrf.set_amp_enable(amp_enable);
+        return sdr->set_lna_gain(lna_gain) &&
+               sdr->set_vga_gain(vga_gain) &&
+               sdr->set_amp_enable(amp_enable);
     };
 
     // ── Start wideband ──
     auto start_scanning = [&]() -> bool {
-        hackrf.stop();
-        if (!hackrf.set_sample_rate(WIDEBAND_SAMPLE_RATE) ||
+        sdr->stop();
+        if (!sdr->set_sample_rate(WIDEBAND_SAMPLE_RATE) ||
             !apply_gains() ||
-            !hackrf.set_freq(center_freq)) {
-            std::fprintf(stderr, "HackRF config failed: %s\n", hackrf.last_error());
+            !sdr->set_freq(center_freq)) {
+            std::fprintf(stderr, "SDR config failed: %s\n", sdr->last_error());
             return false;
         }
-        if (!hackrf.start([&](const std::complex<float>* s, size_t n) {
+        if (!sdr->start([&](const std::complex<float>* s, size_t n) {
                 monitor.ingest(s, n);
             })) {
-            std::fprintf(stderr, "HackRF start failed: %s\n", hackrf.last_error());
+            std::fprintf(stderr, "SDR start failed: %s\n", sdr->last_error());
             return false;
         }
         mode = Mode::SCANNING;
@@ -142,7 +144,7 @@ static int voice_follow_mode(HackrfSource& hackrf,
 
     // ── Start narrowband on a specific channel ──
     auto start_narrowband = [&](int ch_idx) -> bool {
-        hackrf.stop();
+        sdr->stop();
 
         nb.phase_diff = PhaseDiff();
         nb.dc_blocker.reset();
@@ -187,21 +189,21 @@ static int voice_follow_mode(HackrfSource& hackrf,
         );
 
         uint64_t freq = channels[ch_idx].freq_hz;
-        if (!hackrf.set_sample_rate(SAMPLE_RATE) ||
+        if (!sdr->set_sample_rate(SAMPLE_RATE) ||
             !apply_gains() ||
-            !hackrf.set_freq(freq)) {
-            std::fprintf(stderr, "HackRF config failed: %s\n", hackrf.last_error());
+            !sdr->set_freq(freq)) {
+            std::fprintf(stderr, "SDR config failed: %s\n", sdr->last_error());
             return false;
         }
 
-        if (!hackrf.start([&](const std::complex<float>* samples, size_t n) {
+        if (!sdr->start([&](const std::complex<float>* samples, size_t n) {
                 for (size_t i = 0; i < n; ++i) {
                     auto s = nb.dc_blocker.process(samples[i]);
                     float phase = nb.phase_diff.process(s);
                     nb.receiver->process_sample(phase);
                 }
             })) {
-            std::fprintf(stderr, "HackRF start failed: %s\n", hackrf.last_error());
+            std::fprintf(stderr, "SDR start failed: %s\n", sdr->last_error());
             return false;
         }
 
@@ -386,7 +388,7 @@ static int voice_follow_mode(HackrfSource& hackrf,
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
-    hackrf.stop();
+    sdr->stop();
     audio.stop();
     std::printf("\x1b[H\x1b[J");
     std::printf("DeDECTive — stopped.\n");
@@ -455,6 +457,7 @@ static void print_usage(const char* prog) {
         "  (default)  Voice follow — scans for DECT calls, auto-tunes and decodes voice\n"
         "  -W         Wideband monitor (no auto-follow)\n"
         "  -c <ch>    Fixed channel scan\n"
+        "  -V         Voice enable\n"
         "\nOptions:\n"
         "  -g <lna>   LNA gain  0-40 dB, steps of 8  (default: 32)\n"
         "  -v <vga>   VGA gain  0-62 dB, steps of 2  (default: 20)\n"
@@ -462,6 +465,7 @@ static void print_usage(const char* prog) {
         "  -d <secs>  Dwell time per channel, seconds (default: 3)\n"
         "  -l         Loop continuously until Ctrl-C\n"
         "  -e         EU band (1880 MHz) instead of US (1920 MHz)\n"
+        "  -P         Use Pluto device instead of HackRF\n"
         "  -h         Show this help\n"
         "\nKeyboard (voice follow mode):\n"
         "  n          Next voice channel\n"
@@ -481,6 +485,7 @@ int main(int argc, char* argv[]) {
     bool     loop         = false;
     bool     wideband     = false;
     bool     voice_en     = false;
+    bool     use_pluto    = false;
     DectBand band         = DectBand::US;
 
     for (int i = 1; i < argc; ++i) {
@@ -492,6 +497,7 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i], "-l") == 0)               loop        = true;
         else if (strcmp(argv[i], "-W") == 0)               wideband    = true;
         else if (strcmp(argv[i], "-V") == 0)               voice_en    = true;
+        else if (strcmp(argv[i], "-P") == 0)               use_pluto   = true;
         else if (strcmp(argv[i], "-e") == 0)               band        = DectBand::EU;
         else if (strcmp(argv[i], "-h") == 0) { print_usage(argv[0]); return 0; }
         else { std::fprintf(stderr, "Unknown option: %s\n", argv[i]); print_usage(argv[0]); return 1; }
@@ -532,19 +538,25 @@ int main(int argc, char* argv[]) {
     }
     std::printf("\n");
 
-    // Open HackRF
-    HackrfSource hackrf;
-    std::printf("DeDECTive — Opening HackRF... ");
+    std::unique_ptr<SdrSource> sdr;
+    if (!use_pluto) {
+        sdr = std::make_unique<HackrfSource>();
+        std::printf("DeDECTive — Opening HackRF... ");
+    }
+    else {
+        sdr = std::make_unique<PlutoSource>();
+        std::printf("DeDECTive — Opening pluto... ");
+    }
     std::fflush(stdout);
-    if (!hackrf.open()) {
-        std::fprintf(stderr, "FAILED: %s\n", hackrf.last_error());
+    if (!sdr->open()) {
+        std::fprintf(stderr, "FAILED: SDR, %s\n", sdr->last_error());
         return 1;
     }
     std::printf("OK\n");
 
     // ── Default mode: voice follow ──
     if (!wideband && fixed_chan < 0) {
-        return voice_follow_mode(hackrf, lna_gain, vga_gain, amp_enable, band);
+        return voice_follow_mode(sdr, lna_gain, vga_gain, amp_enable, band);
     }
 
     // ── Legacy wideband monitor ──
@@ -553,11 +565,11 @@ int main(int argc, char* argv[]) {
 
         const auto& channels = dect_channels(band);
         uint32_t sample_rate = WIDEBAND_SAMPLE_RATE;
-        if (!hackrf.set_sample_rate(sample_rate) ||
-            !hackrf.set_lna_gain(lna_gain) ||
-            !hackrf.set_vga_gain(vga_gain) ||
-            !hackrf.set_amp_enable(amp_enable)) {
-            std::fprintf(stderr, "Config failed: %s\n", hackrf.last_error());
+        if (!sdr->set_sample_rate(sample_rate) ||
+            !sdr->set_lna_gain(lna_gain) ||
+            !sdr->set_vga_gain(vga_gain) ||
+            !sdr->set_amp_enable(amp_enable)) {
+            std::fprintf(stderr, "Config failed: %s\n", sdr->last_error());
             return 1;
         }
 
@@ -569,11 +581,11 @@ int main(int argc, char* argv[]) {
             std::printf("Voice decode enabled\n");
         }
         uint64_t wb_center = dect_center_freq(band);
-        if (!hackrf.set_freq(wb_center) ||
-            !hackrf.start([&monitor](const std::complex<float>* s, size_t n) {
+        if (!sdr->set_freq(wb_center) ||
+            !sdr->start([&monitor](const std::complex<float>* s, size_t n) {
                 monitor.ingest(s, n);
             })) {
-            std::fprintf(stderr, "Start failed: %s\n", hackrf.last_error());
+            std::fprintf(stderr, "Start failed: %s\n", sdr->last_error());
             return 1;
         }
 
@@ -582,18 +594,18 @@ int main(int argc, char* argv[]) {
             monitor.render_frame();
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
-        hackrf.stop();
+        sdr->stop();
         std::printf("\nDone.\n");
         return 0;
     }
 
     // ── Legacy fixed-channel scan ──
     const auto& channels = dect_channels(band);
-    if (!hackrf.set_sample_rate(SAMPLE_RATE) ||
-        !hackrf.set_lna_gain(lna_gain) ||
-        !hackrf.set_vga_gain(vga_gain) ||
-        !hackrf.set_amp_enable(amp_enable)) {
-        std::fprintf(stderr, "Config failed: %s\n", hackrf.last_error());
+    if (!sdr->set_sample_rate(SAMPLE_RATE) ||
+        !sdr->set_lna_gain(lna_gain) ||
+        !sdr->set_vga_gain(vga_gain) ||
+        !sdr->set_amp_enable(amp_enable)) {
+        std::fprintf(stderr, "Config failed: %s\n", sdr->last_error());
         return 1;
     }
 
@@ -615,11 +627,11 @@ int main(int argc, char* argv[]) {
             AudioOutput* aptr = (voice_en && scan_audio.is_running()) ? &scan_audio : nullptr;
             ScanContext ctx(chan.number, chan.freq_hz, aptr);
 
-            if (!hackrf.set_freq(chan.freq_hz) ||
-                !hackrf.start([&ctx](const std::complex<float>* s, size_t n) {
+            if (!sdr->set_freq(chan.freq_hz) ||
+                !sdr->start([&ctx](const std::complex<float>* s, size_t n) {
                     iq_callback(&ctx, s, n);
                 })) {
-                std::fprintf(stderr, "  Failed: %s — skipping\n", hackrf.last_error());
+                std::fprintf(stderr, "  Failed: %s — skipping\n", sdr->last_error());
                 continue;
             }
 
@@ -633,7 +645,7 @@ int main(int argc, char* argv[]) {
                     deadline = Clock::now() + std::chrono::seconds(dwell_secs);
                 }
             }
-            hackrf.stop();
+            sdr->stop();
 
             if (ctx.packets_seen > 0)
                 std::printf("  Summary ch%d: %llu sync locks, %d active device(s)\n",

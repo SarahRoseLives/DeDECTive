@@ -1,4 +1,5 @@
 #pragma once
+#include "sdr_source.h"
 #include <hackrf.h>
 #include <cstdint>
 #include <cstddef>
@@ -10,9 +11,6 @@
 #include <complex>
 
 namespace dedective {
-
-// Callback type: called with a buffer of complex<float> IQ samples
-using IQCallback = std::function<void(const std::complex<float>*, size_t)>;
 
 // Wraps libhackrf for simple blocking or async DECT reception.
 //
@@ -29,7 +27,7 @@ using IQCallback = std::function<void(const std::complex<float>*, size_t)>;
 //   src.stop();
 //   src.close();
 
-class HackrfSource {
+class HackrfSource : public dedective::SdrSource {
 public:
     HackrfSource();
     ~HackrfSource();
@@ -50,7 +48,7 @@ public:
     bool set_amp_enable(bool enable);
 
     // Streaming
-    bool start(IQCallback cb);
+    bool start(dedective::SdrSource::IQCallback cb);
     bool stop();
 
     bool is_streaming() const;

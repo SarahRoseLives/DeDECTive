@@ -9,6 +9,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(PkgConfig REQUIRED)
 
 pkg_check_modules(HACKRF REQUIRED IMPORTED_TARGET libhackrf)
+pkg_check_modules(IIO REQUIRED IMPORTED_TARGET libiio)
 pkg_check_modules(PULSE REQUIRED IMPORTED_TARGET libpulse-simple)
 
 option(BUILD_GUI "Build the GUI frontend (requires imgui, SDL2, OpenGL)" ON)
@@ -35,6 +36,7 @@ endif()
 
 add_library(dedective_core
     src/hackrf_source.cpp
+    src/pluto_source.cpp
     src/packet_receiver.cpp
     src/packet_decoder.cpp
     src/wideband_monitor.cpp
@@ -45,6 +47,7 @@ add_library(dedective_core
 target_link_libraries(dedective_core PUBLIC
     PkgConfig::HACKRF
     PkgConfig::PULSE
+    PkgConfig::IIO
 )
 
 target_include_directories(dedective_core PUBLIC
