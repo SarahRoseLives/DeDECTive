@@ -25,6 +25,9 @@ public:
     bool set_vga_gain(uint32_t gain_db);
     bool set_amp_enable(bool enable);
 
+    bool is_streaming() const { return streaming_; }
+    const char* last_error() const { return last_error_; }
+
 private:
     IQCallback callback_;
 
@@ -40,9 +43,6 @@ private:
     iio_buffer* rxbuf_ = nullptr;
 
     void rx_loop();
-
-    bool is_streaming() const { return streaming_; }
-    const char* last_error() const { return last_error_; }
 
     // Conversion scratch buffer — reused across callbacks to avoid alloc
     bool buff_1_flag_ = true;
