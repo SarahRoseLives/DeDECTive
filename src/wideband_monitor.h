@@ -1,6 +1,6 @@
 #pragma once
 
-#include "dect_channels.h"
+#include "scanner.h"
 #include "packet_decoder.h"
 #include "packet_receiver.h"
 #include "phase_diff.h"
@@ -17,37 +17,7 @@
 
 namespace dedective {
 
-inline constexpr uint32_t WIDEBAND_SAMPLE_RATE = 18'432'000;
-inline constexpr size_t DECT_SLOT_COUNT = 24;
-
-struct WidebandChannelView {
-    int      channel_number      = -1;
-    uint64_t freq_hz             = 0;
-    float    smoothed_power_db   = 0.0f;
-    float    relative_power_db   = 0.0f;
-    bool     active              = false;
-    bool     voice_detected      = false;
-    bool     qt_synced           = false;
-    int      active_parts        = 0;
-    uint64_t packets_seen        = 0;
-    uint64_t voice_frames_ok     = 0;
-    uint64_t voice_xcrc_fail     = 0;
-    uint64_t voice_skipped       = 0;
-};
-
-struct WidebandSnapshot {
-    bool ready = false;
-    size_t buffered_samples = 0;
-    float noise_floor_db = 0.0f;
-    std::vector<float> fft_db;
-    std::vector<float> waterfall_db;
-    size_t waterfall_rows = 0;
-    size_t waterfall_cols = 0;
-    std::array<std::array<uint8_t, DECT_SLOT_COUNT>, NUM_DECT_CHANNELS> slot_state{};
-    std::array<WidebandChannelView, NUM_DECT_CHANNELS> channels{};
-};
-
-class WidebandMonitor {
+class WidebandMonitor : public Scanner {
 public:
     static constexpr size_t FFT_SIZE = 16'384;
     static constexpr size_t FFT_PLOT_BINS = 256;
@@ -57,22 +27,22 @@ public:
 
     // Reconfigure for a different DECT band.  Must be called while
     // capture is stopped (before ingest()).
-    void set_band(DectBand band);
-    uint64_t center_freq() const { return center_freq_hz_; }
+    void set_band(DectBand band) override;
+    uint64_t center_freq() const override { return center_freq_hz_; }
 
-    void ingest(const std::complex<float>* samples, size_t n);
-    bool update_visuals();
-    WidebandSnapshot snapshot() const;
-    void render_frame();
+    void ingest(const std::complex<float>* samples, size_t n) override;
+    bool update_visuals() override;
+    WidebandSnapshot snapshot() const override;
+    void render_frame() override;
 
     // Audio output control
-    void set_audio_output(AudioOutput* audio);
-    void set_audio_channel(int channel_index);  // -1 = auto (first voice channel)
-    int  audio_channel() const;
+    void set_audio_output(AudioOutput* audio) override;
+    void set_audio_channel(int channel_index) override;  // -1 = auto (first voice channel)
+    int  audio_channel() const override;
 
     // DC offset correction
-    void set_dc_block(bool enabled);
-    bool dc_block_enabled() const;
+    void set_dc_block(bool enabled) override;
+    bool dc_block_enabled() const override;
 
 private:
     struct ChannelDecoderSnapshot {

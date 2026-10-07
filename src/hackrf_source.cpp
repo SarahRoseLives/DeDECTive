@@ -1,4 +1,7 @@
 #include "hackrf_source.h"
+
+#ifdef DEDECTIVE_HAVE_HACKRF
+
 #include <hackrf.h>
 #include <cstdio>
 #include <cstring>
@@ -187,3 +190,5 @@ bool HackrfSource::is_streaming() const {
 }
 
 } // namespace dedective
+
+#endif // DEDECTIVE_HAVE_HACKRF

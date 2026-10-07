@@ -1,5 +1,8 @@
-#include "hackrf_source.h"
+#define SDL_MAIN_HANDLED
+#include "iq_source.h"
+#include "source_factory.h"
 #include "wideband_monitor.h"
+#include "hopping_scanner.h"
 #include "packet_receiver.h"
 #include "packet_decoder.h"
 #include "phase_diff.h"
@@ -46,6 +49,7 @@ struct GuiState {
     bool  dc_block = true;     // DC offset correction enabled
     bool  follow_call = false; // auto-retune when call moves channels
     int   band_index = 0;      // 0 = US, 1 = EU
+    int   source_index = 0;    // index into available source list
 };
 
 // Narrowband state: single-channel decode pipeline
@@ -70,9 +74,10 @@ struct NarrowbandContext {
 };
 
 struct CaptureController {
-    HackrfSource     hackrf;
-    WidebandMonitor  monitor;
-    AudioOutput      audio;
+    std::unique_ptr<IqSource> source;
+    std::unique_ptr<Scanner>  scanner;
+    AudioOutput               audio;
+    SourceType                desired_source = SourceType::Auto;
     bool             device_open = false;
     CaptureMode      mode = CaptureMode::IDLE;
     uint32_t         lna_gain = 32;
@@ -85,6 +90,16 @@ struct CaptureController {
     // Narrowband state
     NarrowbandContext nb;
 
+    const char* source_name() const { return source ? source->name() : "-"; }
+
+    // Change the desired backend (applied on the next start()).
+    void set_source_type(SourceType type) {
+        if (type == desired_source && source) return;
+        stop();
+        source.reset();
+        desired_source = type;
+    }
+
     // ── Wideband capture ─────────────────────────────────────────────
     bool start_wideband() {
         if (mode != CaptureMode::IDLE) stop();
@@ -92,18 +107,42 @@ struct CaptureController {
         last_error.clear();
         if (!open_device()) return false;
 
-        if (!hackrf.set_sample_rate(WIDEBAND_SAMPLE_RATE) ||
-            !apply_gains() ||
-            !hackrf.set_freq(monitor.center_freq())) {
-            last_error = hackrf.last_error();
-            return false;
-        }
+        scanner.reset();
+        if (source->supports_full_wideband()) {
+            auto monitor = std::make_unique<WidebandMonitor>();
+            monitor->set_band(active_band);
+            monitor->set_dc_block(dc_block_enabled);
+            const uint64_t center = monitor->center_freq();
 
-        if (!hackrf.start([this](const std::complex<float>* samples, size_t n) {
-                monitor.ingest(samples, n);
-            })) {
-            last_error = hackrf.last_error();
-            return false;
+            if (!source->set_sample_rate(WIDEBAND_SAMPLE_RATE) ||
+                !apply_gains() ||
+                !source->set_freq(center)) {
+                last_error = source->last_error();
+                return false;
+            }
+
+            scanner = std::move(monitor);
+            if (!source->start([this](const std::complex<float>* samples, size_t n) {
+                    scanner->ingest(samples, n);
+                })) {
+                last_error = source->last_error();
+                return false;
+            }
+        } else {
+            // Bandwidth-limited device (e.g. SDRplay): hop channel by channel.
+            auto hopper = std::make_unique<HoppingScanner>(*source);
+            hopper->set_band(active_band);
+            hopper->set_dc_block(dc_block_enabled);
+
+            if (!apply_gains()) {
+                last_error = source->last_error();
+                return false;
+            }
+            if (!hopper->start()) {
+                last_error = source->last_error();
+                return false;
+            }
+            scanner = std::move(hopper);
         }
 
         mode = CaptureMode::WIDEBAND;
@@ -176,14 +215,14 @@ struct CaptureController {
         );
 
         uint64_t freq = channels[channel_index].freq_hz;
-        if (!hackrf.set_sample_rate(SAMPLE_RATE) ||
+        if (!source->set_sample_rate(SAMPLE_RATE) ||
             !apply_gains() ||
-            !hackrf.set_freq(freq)) {
-            last_error = hackrf.last_error();
+            !source->set_freq(freq)) {
+            last_error = source->last_error();
             return false;
         }
 
-        if (!hackrf.start([this](const std::complex<float>* samples, size_t n) {
+        if (!source->start([this](const std::complex<float>* samples, size_t n) {
                 for (size_t i = 0; i < n; ++i) {
                     auto s = dc_block_enabled
                         ? nb.dc_blocker.process(samples[i]) : samples[i];
@@ -191,7 +230,7 @@ struct CaptureController {
                     nb.receiver->process_sample(phase);
                 }
             })) {
-            last_error = hackrf.last_error();
+            last_error = source->last_error();
             return false;
         }
 
@@ -205,11 +244,10 @@ struct CaptureController {
     }
 
     void stop() {
-        if (mode != CaptureMode::IDLE) {
-            hackrf.stop();
-        }
-        if (device_open) {
-            hackrf.close();
+        if (source) source->stop();
+        scanner.reset();
+        if (device_open && source) {
+            source->close();
             device_open = false;
         }
         audio.stop();
@@ -225,9 +263,19 @@ struct CaptureController {
 
 private:
     bool open_device() {
+        if (!source) {
+            std::string err;
+            source = open_source(desired_source, err);
+            if (!source) {
+                last_error = err;
+                return false;
+            }
+            device_open = true;
+            return true;
+        }
         if (!device_open) {
-            if (!hackrf.open()) {
-                last_error = hackrf.last_error();
+            if (!source->open()) {
+                last_error = source->last_error();
                 return false;
             }
             device_open = true;
@@ -236,9 +284,9 @@ private:
     }
 
     bool apply_gains() {
-        return hackrf.set_lna_gain(lna_gain) &&
-               hackrf.set_vga_gain(vga_gain) &&
-               hackrf.set_amp_enable(amp_enable);
+        return source->set_lna_gain(lna_gain) &&
+               source->set_vga_gain(vga_gain) &&
+               source->set_amp_enable(amp_enable);
     }
 };
 
@@ -792,6 +840,21 @@ int main(int argc, char* argv[]) {
 
     CaptureController controller;
     GuiState gui_state;
+
+    // Backend selection list: Auto plus every known backend (unavailable ones
+    // are labelled as such).
+    std::vector<std::string> source_labels = { "Auto" };
+    std::vector<SourceType>  source_types  = { SourceType::Auto };
+    for (SourceType t : known_source_types()) {
+        std::string label = source_type_name(t);
+        if (!source_type_available(t)) label += " (unavailable)";
+        source_labels.push_back(label);
+        source_types.push_back(t);
+    }
+    std::vector<const char*> source_label_ptrs;
+    source_label_ptrs.reserve(source_labels.size());
+    for (const auto& s : source_labels) source_label_ptrs.push_back(s.c_str());
+
     const bool auto_start = demo_seconds > 0 || !screenshot_path.empty();
     bool screenshot_taken = false;
     auto auto_deadline = std::chrono::steady_clock::time_point{};
@@ -827,10 +890,11 @@ int main(int argc, char* argv[]) {
         const bool is_narrowband = controller.mode == CaptureMode::NARROWBAND;
         const bool is_active    = is_wideband || is_narrowband;
 
-        if (is_wideband) {
-            controller.monitor.update_visuals();
+        if (is_wideband && controller.scanner) {
+            controller.scanner->update_visuals();
         }
-        const WidebandSnapshot snapshot = controller.monitor.snapshot();
+        const WidebandSnapshot snapshot =
+            controller.scanner ? controller.scanner->snapshot() : WidebandSnapshot{};
 
         // ── Follow-call logic ────────────────────────────────────────
         if (gui_state.follow_call) {
@@ -933,9 +997,9 @@ int main(int argc, char* argv[]) {
             ImGui::Text("Channel %d  %.3f MHz  Sample rate %.3f Msps",
                         ch.number, ch.freq_hz / 1e6, SAMPLE_RATE / 1e6);
         } else {
-            ImGui::Text("DeDECTive — wideband scanner");
+            ImGui::Text("DeDECTive — scanning  Source: %s", controller.source_name());
             ImGui::Text("Center %.3f MHz  Sample rate %.3f Msps",
-                        controller.monitor.center_freq() / 1e6,
+                        dect_center_freq(controller.active_band) / 1e6,
                         WIDEBAND_SAMPLE_RATE / 1e6);
         }
         ImGui::Separator();
@@ -958,28 +1022,34 @@ int main(int argc, char* argv[]) {
         if (ImGui::SliderInt("VGA gain", &vga_gain, 0, 62)) {
             controller.vga_gain = static_cast<uint32_t>(vga_gain);
         }
-        ImGui::Checkbox("HackRF amp", &controller.amp_enable);
+        ImGui::Checkbox("RF amp", &controller.amp_enable);
         ImGui::EndDisabled();
 
         if (ImGui::Checkbox("DC correction", &gui_state.dc_block)) {
             controller.dc_block_enabled = gui_state.dc_block;
-            controller.monitor.set_dc_block(gui_state.dc_block);
+            if (controller.scanner) controller.scanner->set_dc_block(gui_state.dc_block);
         }
 
         ImGui::Spacing();
         ImGui::BeginDisabled(is_active);
         {
+            if (!source_labels.empty()) {
+                if (ImGui::Combo("Source", &gui_state.source_index,
+                                 source_label_ptrs.data(),
+                                 static_cast<int>(source_label_ptrs.size()))) {
+                    controller.set_source_type(source_types[gui_state.source_index]);
+                }
+            }
             const char* bands[] = { "US Band (1920 MHz)", "EU Band (1880 MHz)" };
             if (ImGui::Combo("Band", &gui_state.band_index, bands, 2)) {
                 DectBand new_band = gui_state.band_index == 0 ? DectBand::US : DectBand::EU;
                 controller.active_band = new_band;
-                controller.monitor.set_band(new_band);
             }
         }
         ImGui::EndDisabled();
 
         if (!is_active) {
-            if (ImGui::Button("Start wideband scan", ImVec2(-1.0f, 0.0f))) {
+            if (ImGui::Button("Start scan", ImVec2(-1.0f, 0.0f))) {
                 controller.start_wideband();
             }
         } else {
@@ -1074,7 +1144,7 @@ int main(int argc, char* argv[]) {
                                  fft_h),
                           gui_state.fft_min_db,
                           gui_state.fft_max_db,
-                          controller.monitor.center_freq());
+                          dect_center_freq(controller.active_band));
             ImGui::SameLine();
             draw_vertical_range_controls("min", "max",
                                          &gui_state.fft_min_db, &gui_state.fft_max_db,
@@ -1089,7 +1159,7 @@ int main(int argc, char* argv[]) {
                                   waterfall_h),
                            gui_state.waterfall_min_db,
                            gui_state.waterfall_max_db,
-                           controller.monitor.center_freq());
+                           dect_center_freq(controller.active_band));
             ImGui::SameLine();
             draw_vertical_range_controls("min", "max",
                                          &gui_state.waterfall_min_db, &gui_state.waterfall_max_db,
